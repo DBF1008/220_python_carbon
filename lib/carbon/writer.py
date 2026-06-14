@@ -12,6 +12,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License."""
 
+import threading
 import time
 from six.moves import queue
 
@@ -34,6 +35,62 @@ except ImportError:
 
 SCHEMAS = loadStorageSchemas()
 AGGREGATION_SCHEMAS = loadAggregationSchemas()
+
+
+class SchemaMatchCache(object):
+  """Memoize first-match schema selection for new metrics, keyed by metric name.
+
+  Matching a new metric against the (potentially large) storage/aggregation schema
+  lists is a per-metric regex scan and a hotspot when new metrics are dense. This
+  caches the first schema that matches a given metric name so repeated lookups skip
+  the scan.
+
+  The cache is bound to the identity of the schema list it was built against. The
+  reload tasks replace the SCHEMAS / AGGREGATION_SCHEMAS globals with brand new list
+  objects on success (and leave them untouched on failure). Callers pass the current
+  list into match(); when that list is a different object than the one the cache was
+  built against, the cache is rebuilt. This makes invalidation atomic with the swap:
+  a result computed against a now-stale list can never be served, and a failed reload
+  (no swap) keeps the cache valid. invalidate() additionally drops everything eagerly
+  so a successful reload frees the entries immediately rather than at the next write.
+
+  Safe for the single writer thread populating the cache concurrently with
+  reactor-thread invalidation: all access is guarded by a lock.
+  """
+
+  def __init__(self):
+    self._lock = threading.Lock()
+    self._schemas = None      # the schema list object this cache is bound to
+    self._matches = {}        # metric name -> matched schema (or None for no match)
+
+  def match(self, schemas, metric):
+    with self._lock:
+      if schemas is not self._schemas:
+        # The schema list was swapped (a successful reload, or first use). Anything
+        # cached was computed against a different list, so start fresh.
+        self._schemas = schemas
+        self._matches = {}
+      try:
+        # A cached None means "scanned, nothing matched" and must be honored.
+        return self._matches[metric]
+      except KeyError:
+        pass
+      matched = None
+      for schema in schemas:
+        if schema.matches(metric):
+          matched = schema
+          break
+      self._matches[metric] = matched
+      return matched
+
+  def invalidate(self):
+    with self._lock:
+      self._schemas = None
+      self._matches = {}
+
+
+STORAGE_SCHEMA_CACHE = SchemaMatchCache()
+AGGREGATION_SCHEMA_CACHE = SchemaMatchCache()
 
 
 # Initialize token buckets so that we can enforce rate limits on creates and
@@ -117,20 +174,18 @@ def writeCachedDataPoints():
       archiveConfig = None
       xFilesFactor, aggregationMethod = None, None
 
-      for schema in SCHEMAS:
-        if schema.matches(metric):
-          if settings.LOG_CREATES:
-            log.creates('new metric %s matched schema %s' % (metric, schema.name))
-          archiveConfig = [archive.getTuple() for archive in schema.archives]
-          break
+      schema = STORAGE_SCHEMA_CACHE.match(SCHEMAS, metric)
+      if schema is not None:
+        if settings.LOG_CREATES:
+          log.creates('new metric %s matched schema %s' % (metric, schema.name))
+        archiveConfig = [archive.getTuple() for archive in schema.archives]
 
-      for schema in AGGREGATION_SCHEMAS:
-        if schema.matches(metric):
-          if settings.LOG_CREATES:
-            log.creates('new metric %s matched aggregation schema %s'
-                        % (metric, schema.name))
-          xFilesFactor, aggregationMethod = schema.archives
-          break
+      aggregationSchema = AGGREGATION_SCHEMA_CACHE.match(AGGREGATION_SCHEMAS, metric)
+      if aggregationSchema is not None:
+        if settings.LOG_CREATES:
+          log.creates('new metric %s matched aggregation schema %s'
+                      % (metric, aggregationSchema.name))
+        xFilesFactor, aggregationMethod = aggregationSchema.archives
 
       if not archiveConfig:
         raise Exception(("No storage schema matched the metric '%s',"
@@ -238,6 +293,10 @@ def reloadStorageSchemas():
     SCHEMAS = loadStorageSchemas()
   except Exception as e:
     log.msg("Failed to reload storage SCHEMAS: %s" % (e))
+  else:
+    # Only invalidate on a successful reload; on failure SCHEMAS is unchanged and
+    # the existing cache (built against it) is still correct.
+    STORAGE_SCHEMA_CACHE.invalidate()
 
 
 def reloadAggregationSchemas():
@@ -246,6 +305,9 @@ def reloadAggregationSchemas():
     AGGREGATION_SCHEMAS = loadAggregationSchemas()
   except Exception as e:
     log.msg("Failed to reload aggregation SCHEMAS: %s" % (e))
+  else:
+    # Only invalidate on a successful reload; see reloadStorageSchemas().
+    AGGREGATION_SCHEMA_CACHE.invalidate()
 
 
 def shutdownModifyUpdateSpeed():
