@@ -1,3 +1,9 @@
+from os.path import exists, getmtime
+
+from twisted.internet.task import LoopingCall
+
+from carbon import log
+from carbon.exceptions import CarbonConfigException
 from carbon.hashing import ConsistentHashRing, carbonHash
 from carbon.util import PluginRegistrar
 from six import with_metaclass
@@ -58,14 +64,71 @@ class RelayRulesRouter(DatapointRouter):
   plugin_name = 'rules'
 
   def __init__(self, settings):
+    self.rules_path = settings["relay-rules"]
+    self.rules = []
+    self.destinations = set()
+    self.rules_last_read = 0.0
+    self.read_task = LoopingCall(self.read_rules)
+
+    # Initial load: fail-fast on any error (preserves startup behaviour).
+    self.read_rules(initial=True)
+
+    if not self.read_task.running:
+      self.read_task.start(10, now=False)
+
+  def read_rules(self, initial=False):
+    """Reload relay rules from disk if the file has changed.
+
+    On parse error at runtime, retains previous valid rules and logs the
+    failure.  During initial load (``initial=True``), exceptions are
+    re-raised so that startup fails fast.
+    """
     # We need to import relayrules here to avoid circular dependencies.
     from carbon.relayrules import loadRelayRules
 
-    rules_path = settings["relay-rules"]
+    if not exists(self.rules_path):
+      if initial:
+        raise CarbonConfigException(
+          "Relay rules file %s does not exist" % self.rules_path)
+      log.relay("Relay rules file %s missing, clearing rules" % self.rules_path)
+      self.rules = []
+      self.rules_last_read = 0.0
+      return
 
-    self.rules_path = rules_path
-    self.rules = loadRelayRules(rules_path)
-    self.destinations = set()
+    try:
+      mtime = getmtime(self.rules_path)
+    except (OSError, IOError) as e:
+      if initial:
+        raise
+      log.err("Failed to stat relay rules file %s: %s" % (self.rules_path, e))
+      return
+
+    if mtime <= self.rules_last_read:
+      return
+
+    try:
+      new_rules = loadRelayRules(self.rules_path)
+    except CarbonConfigException as e:
+      if initial:
+        raise
+      log.err("Failed to parse relay rules file %s: %s (keeping previous rules)"
+              % (self.rules_path, e))
+      return
+    except Exception as e:
+      if initial:
+        raise
+      log.err("Unexpected error loading relay rules %s: %s (keeping previous rules)"
+              % (self.rules_path, e))
+      return
+
+    self.rules = new_rules
+    self.rules_last_read = mtime
+    log.relay("Reloaded relay rules from %s (%d rules)" % (self.rules_path, len(new_rules)))
+
+  def stop(self):
+    """Stop the periodic rules reload task."""
+    if self.read_task.running:
+      self.read_task.stop()
 
   def addDestination(self, destination):
     self.destinations.add(destination)

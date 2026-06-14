@@ -201,6 +201,18 @@ def setupRelayProcessor(root_service, settings):
   for destination in util.parseDestinations(settings.DESTINATIONS):
     state.client_manager.startClient(destination)
 
+  # If the router has a periodic reload task, stop it on service shutdown.
+  if hasattr(router, 'stop'):
+    from twisted.application.service import Service
+
+    class RouterCleanupService(Service):
+      def stopService(self):
+        router.stop()
+        return Service.stopService(self)
+
+    cleanup = RouterCleanupService()
+    cleanup.setServiceParent(root_service)
+
   if settings.USE_FLOW_CONTROL:
     events.cacheFull.addHandler(events.pauseReceivingMetrics)
     events.cacheSpaceAvailable.addHandler(events.resumeReceivingMetrics)
