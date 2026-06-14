@@ -228,6 +228,10 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
     self.host, self.port, self.carbon_instance = destination
     self.addr = (self.host, self.port)
     self.started = False
+    # Latched True the moment disconnect() begins; never cleared. While set,
+    # the backpressure valve only ever closes -- a drain must not resume
+    # reception (see queueSpaceCallback and destinationUp).
+    self.shutdownInProgress = False
     # This factory maintains protocol state across reconnects
     self.queue = deque()  # Change to make this the sole source of metrics to be sent.
     self.connectedProtocol = None
@@ -271,7 +275,10 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
       log.clients('%s send queue has space available' % self.connectedProtocol)
       self.queueFull = Deferred()
       self.queueFull.addCallbacks(self.queueFullCallback, log.err)
-      state.events.cacheSpaceAvailable()
+      # While shutting down, draining the queue must not reopen reception:
+      # the backpressure valve is one-way (closing only) during shutdown.
+      if not self.shutdownInProgress:
+        state.events.cacheSpaceAvailable()
     self.queueHasSpace = Deferred()
     self.queueHasSpace.addCallbacks(self.queueSpaceCallback, log.err)
 
@@ -426,7 +433,10 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
     if not self.router.hasDestination(destination):
       log.clients("Adding client %s:%d:%s to router" % destination)
       self.router.addDestination(destination)
-      state.events.resumeReceivingMetrics()
+      # A connection that completes after shutdown has begun must not reopen
+      # reception; keep the shutdown backpressure one-way (closing only).
+      if not self.shutdownInProgress:
+        state.events.resumeReceivingMetrics()
 
   def destinationDown(self, destination):
     # Only blacklist the destination if we tried a lot.
@@ -451,11 +461,39 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
       self.queue.clear()
 
   def disconnect(self):
+    """Gracefully stop this factory, converging the shutdown lifecycle in a
+    fixed order so backpressure stays one-way (closing only) throughout:
+
+    1. Stop receiving -- latch ``shutdownInProgress`` (so nothing below can
+       reopen reception) and pause the receivers, halting inbound metrics.
+    2. Drain the queue -- flush everything still queued to the destination.
+       High priority (carbon-internal) datapoints live at the head of the
+       deque, so they are always drained ahead of regular metrics.
+    3. Disconnect downstream -- once the queue is empty, stop connecting and
+       drop the protocol.
+    4. Finalize -- ``readyToStop`` fires once the connection is gone (or was
+       never established).
+
+    Returns a Deferred (``readyToStop``) that fires when teardown is done.
+    """
+    # Phase 1: stop receiving. Latch the flag first so any drain kicked off
+    # below cannot flip the valve back open, then pause inbound metrics.
+    self.shutdownInProgress = True
+    state.events.pauseReceivingMetrics()
+
+    # Phase 3: when the queue has fully drained, drop the connection.
     self.queueEmpty.addCallbacks(lambda result: self.stopConnecting(), log.err)
     readyToStop = DeferredList(
       [self.connectionLost, self.connectFailed],
       fireOnOneCallback=True,
       fireOnOneErrback=True)
+
+    # Phase 2: drain the queue. Kick the send loop so a queue that still holds
+    # datapoints (high priority first) is flushed to the destination rather
+    # than waiting on inbound traffic that will never arrive now that
+    # reception is paused.
+    if self.connectedProtocol and self.hasQueuedDatapoints():
+      self.scheduleSend()
     self.checkQueue()
 
     # This can happen if the client is stopped before a connection is ever made
