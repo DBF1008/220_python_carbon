@@ -32,8 +32,53 @@ except ImportError:
     log.msg("Couldn't import signal module")
 
 
-SCHEMAS = loadStorageSchemas()
-AGGREGATION_SCHEMAS = loadAggregationSchemas()
+class _SchemaCache(object):
+  """Cache wrapping a list of schemas with a match-result memo.
+
+  Stores metric-name -> matched-schema mappings so that repeated schema
+  lookups for new metrics are O(1) dict hits instead of O(N) linear scans
+  over the schema list.  The cache is intentionally small (one entry per
+  unique metric that has been through schema matching) and lives only as
+  long as the schema list it was built against.
+
+  Invalidation strategy: on a successful schema reload the caller replaces
+  the entire ``_SchemaCache`` instance (creating a fresh one with an empty
+  cache dict).  The swap is a single name-binding in the parent module,
+  which is atomic under the CPython GIL, so the writer thread never sees a
+  half-old / half-new state.
+  """
+
+  __slots__ = ('schemas', '_cache')
+
+  def __init__(self, schemas):
+    self.schemas = list(schemas)
+    self._cache = {}
+
+  def match(self, metric):
+    """Return the first schema matching *metric*, with memoization.
+
+    Semantics are identical to the original linear scan: schemas are tried
+    in order and the first match wins.  ``DefaultSchema`` (always last)
+    guarantees that a match is always found.
+    """
+    schema = self._cache.get(metric)
+    if schema is not None:
+      return schema
+    for s in self.schemas:
+      if s.matches(metric):
+        schema = s
+        break
+    if schema is not None:
+      self._cache[metric] = schema
+    return schema
+
+  def invalidate(self):
+    """Drop all cached match results (keeps the same schema list)."""
+    self._cache.clear()
+
+
+SCHEMAS = _SchemaCache(loadStorageSchemas())
+AGGREGATION_SCHEMAS = _SchemaCache(loadAggregationSchemas())
 
 
 # Initialize token buckets so that we can enforce rate limits on creates and
@@ -114,23 +159,25 @@ def writeCachedDataPoints():
         cache.new_metrics.appendleft(metric)
         break
 
-      archiveConfig = None
-      xFilesFactor, aggregationMethod = None, None
+      schema_cache = SCHEMAS
+      agg_cache = AGGREGATION_SCHEMAS
 
-      for schema in SCHEMAS:
-        if schema.matches(metric):
-          if settings.LOG_CREATES:
-            log.creates('new metric %s matched schema %s' % (metric, schema.name))
-          archiveConfig = [archive.getTuple() for archive in schema.archives]
-          break
+      storage_schema = schema_cache.match(metric)
+      if storage_schema is not None:
+        if settings.LOG_CREATES:
+          log.creates('new metric %s matched schema %s' % (metric, storage_schema.name))
+        archiveConfig = [archive.getTuple() for archive in storage_schema.archives]
+      else:
+        archiveConfig = None
 
-      for schema in AGGREGATION_SCHEMAS:
-        if schema.matches(metric):
-          if settings.LOG_CREATES:
-            log.creates('new metric %s matched aggregation schema %s'
-                        % (metric, schema.name))
-          xFilesFactor, aggregationMethod = schema.archives
-          break
+      agg_schema = agg_cache.match(metric)
+      if agg_schema is not None:
+        if settings.LOG_CREATES:
+          log.creates('new metric %s matched aggregation schema %s'
+                      % (metric, agg_schema.name))
+        xFilesFactor, aggregationMethod = agg_schema.archives
+      else:
+        xFilesFactor, aggregationMethod = None, None
 
       if not archiveConfig:
         raise Exception(("No storage schema matched the metric '%s',"
@@ -235,7 +282,7 @@ def writeTagsForever():
 def reloadStorageSchemas():
   global SCHEMAS
   try:
-    SCHEMAS = loadStorageSchemas()
+    SCHEMAS = _SchemaCache(loadStorageSchemas())
   except Exception as e:
     log.msg("Failed to reload storage SCHEMAS: %s" % (e))
 
@@ -243,7 +290,7 @@ def reloadStorageSchemas():
 def reloadAggregationSchemas():
   global AGGREGATION_SCHEMAS
   try:
-    AGGREGATION_SCHEMAS = loadAggregationSchemas()
+    AGGREGATION_SCHEMAS = _SchemaCache(loadAggregationSchemas())
   except Exception as e:
     log.msg("Failed to reload aggregation SCHEMAS: %s" % (e))
 
