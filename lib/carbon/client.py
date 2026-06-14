@@ -99,6 +99,11 @@ class CarbonClientProtocol(object):
     self._sendDatapointsNow(datapoints)
     instrumentation.increment(self.sent, len(datapoints))
     instrumentation.increment(self.batchesSent)
+    if settings.DESTINATION_POOL_REPLICAS:
+      # Feed the per-connection drain counter used by replica selection /
+      # quality. Gated so non-pooled mode is unaffected and the counter can't
+      # grow unbounded.
+      self.factory.relaySent += len(datapoints)
     self.factory.checkQueue()
 
   def sendQueued(self):
@@ -153,21 +158,41 @@ class CarbonClientProtocol(object):
     Returns a Bool
 
     True means that quality is good, OR
-    True means that the total received is less than settings.MIN_RESET_STAT_FLOW
+    True means that the recent flow is less than settings.MIN_RESET_STAT_FLOW
 
     False means that quality is bad
+
+    In DESTINATION_POOL_REPLICAS mode several connections serve one host:port
+    and getFactories() steers metrics away from a struggling replica, which
+    starves its attemptedRelays counter -- so a backed-up connection would look
+    healthy by a sent/attemptedRelays ratio and never reset. There we judge the
+    connection by its own standing backlog instead (which selection cannot
+    starve): of the work it has recently been responsible for -- delivered plus
+    still queued -- how much did it actually deliver?
     """
+    if settings.DESTINATION_POOL_REPLICAS:
+      # Keep the per-connection throughput hint fresh for replica selection
+      # whenever pooled replicas are in use, independent of USE_RATIO_RESET.
+      self.factory.updateSendRate()
+
     if not settings.USE_RATIO_RESET:
       return True
 
-    if settings.DESTINATION_POOL_REPLICAS:
-        received = self.factory.attemptedRelays
-    else:
-        received = 'metricsReceived'
-
-    destination_sent = float(instrumentation.prior_stats.get(self.sent, 0))
-    total_received = float(instrumentation.prior_stats.get(received, 0))
     instrumentation.increment(self.slowConnectionReset, 0)
+    destination_sent = float(instrumentation.prior_stats.get(self.sent, 0))
+
+    if settings.DESTINATION_POOL_REPLICAS:
+      # Backlog is not starvable by selection: routing away from a slow replica
+      # keeps its queue high, correctly driving the ratio down toward a reset.
+      backlog = float(self.factory.queueSize)
+      total_owed = destination_sent + backlog
+      if total_owed < settings.MIN_RESET_STAT_FLOW:
+        return True
+      return (destination_sent / total_owed) >= settings.MIN_RESET_RATIO
+
+    # Non-pooled replication: every destination should receive every metric, so
+    # compare this connection's throughput against everything received.
+    total_received = float(instrumentation.prior_stats.get('metricsReceived', 0))
     if total_received < settings.MIN_RESET_STAT_FLOW:
       return True
 
@@ -220,6 +245,10 @@ class CAReplaceClientContextFactory:
 class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFactory, object)):
   plugins = {}
   maxDelay = 5
+  # EWMA weight of the most recent sample when folding per-connection send
+  # throughput in updateSendRate(). Higher reacts faster, lower is smoother.
+  # Overridable per-subclass/test; only consulted in DESTINATION_POOL_REPLICAS mode.
+  SEND_RATE_SMOOTHING = 0.5
 
   def __init__(self, destination, router):
     self.destination = destination
@@ -249,6 +278,12 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
     self.fullQueueDrops = 'destinations.%s.fullQueueDrops' % self.destinationName
     self.queuedUntilConnected = 'destinations.%s.queuedUntilConnected' % self.destinationName
     self.relayMaxQueueLength = 'destinations.%s.relayMaxQueueLength' % self.destinationName
+    # Real-time, per-connection send accounting for DESTINATION_POOL_REPLICAS.
+    # Unlike the attemptedRelays instrumentation counter (which is starved when
+    # getFactories() steers traffic away from a slow replica) these reflect this
+    # single connection's own live drain and are used for replica selection.
+    self.relaySent = 0  # datapoints delivered since the last updateSendRate() fold
+    self.relaySendRate = 0.0  # EWMA throughput hint consumed by connectionCost()
 
   def clientProtocol(self):
     raise NotImplementedError()
@@ -314,6 +349,28 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
   @property
   def queueSize(self):
     return len(self.queue)
+
+  def updateSendRate(self):
+    """Fold the datapoints delivered since the previous call into an EWMA used
+    as this connection's recent-throughput hint for replica selection.
+
+    Clock-free: one "sample" is the work drained between two send cycles, which
+    is enough for the relative ordering connectionCost() needs. Only called in
+    DESTINATION_POOL_REPLICAS mode.
+    """
+    self.relaySendRate = (
+        self.SEND_RATE_SMOOTHING * self.relaySent
+        + (1 - self.SEND_RATE_SMOOTHING) * self.relaySendRate)
+    self.relaySent = 0
+
+  def connectionCost(self):
+    """Selection cost for pooled replicas: standing backlog discounted by recent
+    drain throughput. A replica draining quickly is cheaper to add work to than
+    one with the same queue depth that has stalled, so slow replicas shed load
+    and recovering ones get picked back up. With equal throughput this reduces
+    to ordering by queue size (even balancing).
+    """
+    return self.queueSize / (self.relaySendRate + 1.0)
 
   def hasQueuedDatapoints(self):
     return bool(self.queue)
@@ -656,9 +713,13 @@ class CarbonClientManager(Service):
           # we just put the data into our fake factory / buffer.
           factories.add(self.client_factories[None])
         else:
-          # Else we take the replica with the smallest queue size.
+          # Else we take the replica that can drain added work fastest:
+          # standing backlog discounted by recent throughput (connectionCost).
+          # This avoids repeatedly feeding a stalled replica that merely has a
+          # momentarily small queue, while reducing to smallest-queue balancing
+          # when replicas are equally healthy.
           key = d[0:2]  # Take only host:port, not instance.
-          factories.add(min(self.pooled_factories[key], key=lambda f: f.queueSize))
+          factories.add(min(self.pooled_factories[key], key=lambda f: f.connectionCost()))
     return factories
 
   def sendDatapoint(self, metric, datapoint):
