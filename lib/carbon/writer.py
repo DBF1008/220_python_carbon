@@ -12,8 +12,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License."""
 
+import threading
 import time
-from six.moves import queue
+from collections import OrderedDict
 
 from carbon import state
 from carbon.cache import MetricCache
@@ -52,39 +53,106 @@ if settings.MAX_UPDATES_PER_SECOND != float('inf'):
 
 
 class TagQueue(object):
+  """Bounded, deduplicated, priority-aware batch queue for tag updates.
+
+  Maintains two logical lanes:
+  - *add*: first-time metric creation tags (highest priority, drained first).
+  - *update*: periodic re-tags throttled by per-metric TAG_UPDATE_INTERVAL.
+
+  A given metric appears in at most one lane at a time. Adding a metric
+  that is already in the update lane promotes it to the add lane. Updates
+  for a metric already in the add lane are silently dropped (the pending
+  add will already inform the tag database of the series' existence).
+  """
+
   def __init__(self, maxsize=0, update_interval=1):
-    self.add_queue = queue.Queue(maxsize)
-    self.update_queue = queue.Queue(maxsize)
-    self.update_interval = update_interval
-    self.update_counter = 0
+    self.maxsize = maxsize
+    self.update_interval = max(1, update_interval)
+    self._lock = threading.Lock()
+    # Add lane: metrics needing their first tag call (highest priority).
+    self._add_set = OrderedDict()
+    # Update lane: metrics needing periodic re-tagging.
+    self._update_set = OrderedDict()
+    # Per-metric write counter for TAG_UPDATE_INTERVAL throttling.
+    # Tracks how many update() calls have occurred since the last time
+    # this metric was enqueued for an update.
+    self._update_counters = {}
+    # Instrumentation counters (not thread-safe reads, but good enough
+    # for periodic sampling).
+    self.dropped = 0
+    self.deduped = 0
+
+  def _total_size(self):
+    return len(self._add_set) + len(self._update_set)
 
   def add(self, metric):
-    try:
-      self.add_queue.put_nowait(metric)
-    except queue.Full:
-      pass
+    """Enqueue a first-time creation tag for *metric*.
+
+    If the metric is already in the add lane this is a no-op (dedup).
+    If it is in the update lane it is promoted to the add lane.
+    """
+    with self._lock:
+      if metric in self._add_set:
+        self.deduped += 1
+        return
+      # Promote from update lane if present.
+      if metric in self._update_set:
+        del self._update_set[metric]
+        self._update_counters.pop(metric, None)
+      # Enforce bound: evict the oldest update entry if needed.
+      if self.maxsize and self._total_size() >= self.maxsize:
+        if self._update_set:
+          evicted, _ = self._update_set.popitem(last=False)
+          self._update_counters.pop(evicted, None)
+          self.dropped += 1
+        else:
+          self.dropped += 1
+          return
+      self._add_set[metric] = True
+      # Fresh add: reset any stale counter.
+      self._update_counters.pop(metric, None)
 
   def update(self, metric):
-    self.update_counter = self.update_counter % self.update_interval + 1
-    if self.update_counter == 1:
-      try:
-        self.update_queue.put_nowait(metric)
-      except queue.Full:
-        pass
+    """Schedule a periodic re-tag for *metric*, subject to throttling.
+
+    Only one update per metric is enqueued for every *update_interval*
+    calls. If an add is already pending for the same metric the call is
+    dropped (the add will cover it).
+    """
+    with self._lock:
+      if metric in self._add_set:
+        self.deduped += 1
+        return
+      # Per-metric throttle.
+      count = self._update_counters.get(metric, 0) + 1
+      if count < self.update_interval:
+        self._update_counters[metric] = count
+        return
+      self._update_counters[metric] = 0
+      if metric in self._update_set:
+        self.deduped += 1
+        return
+      if self.maxsize and self._total_size() >= self.maxsize:
+        self.dropped += 1
+        return
+      self._update_set[metric] = True
 
   def getbatch(self, maxsize=1):
+    """Return up to *maxsize* unique metrics, adds before updates."""
     batch = []
-    while len(batch) < maxsize:
-      try:
-        batch.append(self.add_queue.get_nowait())
-      except queue.Empty:
-        break
-    while len(batch) < maxsize:
-      try:
-        batch.append(self.update_queue.get_nowait())
-      except queue.Empty:
-        break
+    with self._lock:
+      while len(batch) < maxsize and self._add_set:
+        metric, _ = self._add_set.popitem(last=False)
+        batch.append(metric)
+      while len(batch) < maxsize and self._update_set:
+        metric, _ = self._update_set.popitem(last=False)
+        self._update_counters.pop(metric, None)
+        batch.append(metric)
     return batch
+
+  def __len__(self):
+    with self._lock:
+      return self._total_size()
 
 
 tagQueue = TagQueue(maxsize=settings.TAG_QUEUE_SIZE, update_interval=settings.TAG_UPDATE_INTERVAL)
