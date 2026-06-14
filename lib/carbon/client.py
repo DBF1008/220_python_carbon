@@ -132,9 +132,16 @@ class CarbonClientProtocol(object):
       return
 
     if not self.connectionQualityMonitor():
-      self.resetConnectionForQualityReasons("Sent: {0}, Received: {1}".format(
-        instrumentation.prior_stats.get(self.sent, 0),
-        instrumentation.prior_stats.get('metricsReceived', 0)))
+      if settings.DESTINATION_POOL_REPLICAS:
+        self.resetConnectionForQualityReasons(
+            "Sent: {0}, Attempted: {1}".format(
+                instrumentation.prior_stats.get(self.sent, 0),
+                instrumentation.prior_stats.get(self.factory.attemptedRelays, 0)))
+      else:
+        self.resetConnectionForQualityReasons(
+            "Sent: {0}, Received: {1}".format(
+                instrumentation.prior_stats.get(self.sent, 0),
+                instrumentation.prior_stats.get('metricsReceived', 0)))
 
     self.sendDatapointsNow(self.factory.takeSomeFromQueue())
     if (self.factory.queueFull.called and queueSize < SEND_QUEUE_LOW_WATERMARK):
@@ -144,37 +151,54 @@ class CarbonClientProtocol(object):
       self.factory.scheduleSend()
 
   def connectionQualityMonitor(self):
-    """Checks to see if the connection for this factory appears to
-    be delivering stats at a speed close to what we're receiving
-    them at.
+    """Checks connection quality based on per-connection throughput.
 
-    This is open to other measures of connection quality.
+    In pooled mode: uses per-connection period-based sent/attempted ratio
+    with queue stall detection as fallback for starved factories.
+    In non-pooled mode: behavior is UNCHANGED (uses global metricsReceived).
 
-    Returns a Bool
-
-    True means that quality is good, OR
-    True means that the total received is less than settings.MIN_RESET_STAT_FLOW
-
-    False means that quality is bad
+    Returns True if the connection is healthy or traffic is too low to judge.
+    Returns False if the connection should be reset.
     """
     if not settings.USE_RATIO_RESET:
       return True
 
-    if settings.DESTINATION_POOL_REPLICAS:
-        received = self.factory.attemptedRelays
-    else:
-        received = 'metricsReceived'
-
-    destination_sent = float(instrumentation.prior_stats.get(self.sent, 0))
-    total_received = float(instrumentation.prior_stats.get(received, 0))
     instrumentation.increment(self.slowConnectionReset, 0)
-    if total_received < settings.MIN_RESET_STAT_FLOW:
-      return True
 
-    if (destination_sent / total_received) < settings.MIN_RESET_RATIO:
-      return False
+    if settings.DESTINATION_POOL_REPLICAS:
+        # Per-connection metrics from the last reporting period
+        attempted_key = self.factory.attemptedRelays
+        sent_key = self.sent
+        attempted_delta = float(instrumentation.prior_stats.get(attempted_key, 0))
+        sent_delta = float(instrumentation.prior_stats.get(sent_key, 0))
+
+        if attempted_delta >= settings.MIN_RESET_STAT_FLOW:
+            # Sufficient traffic volume: use sent/attempted ratio check
+            if attempted_delta > 0 and (sent_delta / attempted_delta) < settings.MIN_RESET_RATIO:
+                return False
+            return True
+        else:
+            # Factory is starved (not getting routed to by pool selection).
+            # Check if the queue is stalled — large queue not draining
+            # for longer than MIN_RESET_INTERVAL.
+            stall = self.factory.queueStallDuration()
+            stall_threshold = int(
+                settings.MAX_QUEUE_SIZE * settings.QUEUE_STALL_THRESHOLD_PCT)
+            if (stall > settings.MIN_RESET_INTERVAL and
+                    self.factory.queueSize > stall_threshold):
+                return False
+            return True
     else:
-      return True
+        # Non-pooled mode: compare per-destination sent against global received
+        received = 'metricsReceived'
+        destination_sent = float(instrumentation.prior_stats.get(self.sent, 0))
+        total_received = float(instrumentation.prior_stats.get(received, 0))
+        if total_received < settings.MIN_RESET_STAT_FLOW:
+            return True
+        if (destination_sent / total_received) < settings.MIN_RESET_RATIO:
+            return False
+        else:
+            return True
 
   def resetConnectionForQualityReasons(self, reason):
     """Only re-sets the connection if it's been
@@ -186,10 +210,20 @@ class CarbonClientProtocol(object):
     if (time() - self.lastResetTime) < float(settings.MIN_RESET_INTERVAL):
       return
     else:
+      if settings.DESTINATION_POOL_REPLICAS:
+        attempted = instrumentation.prior_stats.get(self.factory.attemptedRelays, 0)
+        sent_val = instrumentation.prior_stats.get(self.sent, 0)
+        queue_size = self.factory.queueSize
+        stall = self.factory.queueStallDuration()
+        log.clients(
+            "%s:: resetConnectionForQualityReasons: %s "
+            "[sent=%s attempted=%s queue=%d stall=%.0fs]"
+            % (self, reason, sent_val, attempted, queue_size, stall))
+      else:
+        log.clients("%s:: resetConnectionForQualityReasons: %s" % (self, reason))
       self.factory.connectedProtocol.disconnect()
       self.lastResetTime = time()
       instrumentation.increment(self.slowConnectionReset)
-      log.clients("%s:: resetConnectionForQualityReasons: %s" % (self, reason))
 
   def __str__(self):
     return 'CarbonClientProtocol(%s:%d:%s)' % (self.factory.destination)
@@ -249,6 +283,9 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
     self.fullQueueDrops = 'destinations.%s.fullQueueDrops' % self.destinationName
     self.queuedUntilConnected = 'destinations.%s.queuedUntilConnected' % self.destinationName
     self.relayMaxQueueLength = 'destinations.%s.relayMaxQueueLength' % self.destinationName
+    # Queue stall tracking for connection quality in pooled mode
+    self._queueStallStart = None
+    self._queueSizeAtStallStart = 0
 
   def clientProtocol(self):
     raise NotImplementedError()
@@ -315,6 +352,36 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
   def queueSize(self):
     return len(self.queue)
 
+  def effectiveQueueScore(self):
+    """Replica selection score for pooled mode: lower is better.
+    Returns a (state_penalty, queueSize) tuple. Python sorts tuples
+    lexicographically, so active connections always beat paused ones
+    regardless of queue depth, and paused ones beat disconnected."""
+    if self.connectedProtocol is None:
+      state_penalty = 2  # disconnected: worst
+    elif self.connectedProtocol.paused:
+      state_penalty = 1  # paused by TCP backpressure
+    else:
+      state_penalty = 0  # active and healthy
+    return (state_penalty, self.queueSize)
+
+  def queueStallDuration(self):
+    """Seconds the queue has stayed above stall threshold without meaningful drain.
+    Returns 0 if the queue is not stalled or has been draining."""
+    if self._queueStallStart is None:
+      return 0
+    stall_threshold = int(settings.MAX_QUEUE_SIZE * settings.QUEUE_STALL_THRESHOLD_PCT)
+    # If queue has drained by more than 20% since stall started, reset the clock
+    if (self._queueSizeAtStallStart > 0 and
+            self.queueSize < self._queueSizeAtStallStart * 0.8):
+      self._queueStallStart = time()
+      self._queueSizeAtStallStart = self.queueSize
+      if self.queueSize <= stall_threshold:
+        self._queueStallStart = None
+        self._queueSizeAtStallStart = 0
+        return 0
+    return time() - self._queueStallStart
+
   def hasQueuedDatapoints(self):
     return bool(self.queue)
 
@@ -329,7 +396,13 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
           yield self.queue.popleft()
         except IndexError:
           return
-    return list(yield_max_datapoints())
+    result = list(yield_max_datapoints())
+    # Reset stall timer if queue has drained below threshold
+    stall_threshold = int(settings.MAX_QUEUE_SIZE * settings.QUEUE_STALL_THRESHOLD_PCT)
+    if self.queueSize <= stall_threshold:
+      self._queueStallStart = None
+      self._queueSizeAtStallStart = 0
+    return result
 
   def checkQueue(self):
     """Check if the queue is empty. If the queue isn't empty or
@@ -360,6 +433,12 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
         instrumentation.increment(self.fullQueueDrops)
     else:
       self.enqueue(metric, datapoint)
+
+    # Track queue stall: start timer when queue exceeds stall threshold
+    stall_threshold = int(settings.MAX_QUEUE_SIZE * settings.QUEUE_STALL_THRESHOLD_PCT)
+    if self.queueSize > stall_threshold and self._queueStallStart is None:
+      self._queueStallStart = time()
+      self._queueSizeAtStallStart = self.queueSize
 
     if self.connectedProtocol:
       self.scheduleSend()
@@ -656,9 +735,10 @@ class CarbonClientManager(Service):
           # we just put the data into our fake factory / buffer.
           factories.add(self.client_factories[None])
         else:
-          # Else we take the replica with the smallest queue size.
+          # Else we take the replica with the best effective score
+          # (considers connection state + queue depth).
           key = d[0:2]  # Take only host:port, not instance.
-          factories.add(min(self.pooled_factories[key], key=lambda f: f.queueSize))
+          factories.add(min(self.pooled_factories[key], key=lambda f: f.effectiveQueueScore()))
     return factories
 
   def sendDatapoint(self, metric, datapoint):
