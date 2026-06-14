@@ -34,6 +34,9 @@ def parseDestination(destination):
 class TestRelayRulesRouter(unittest.TestCase):
     def testBasic(self):
         router = routers.RelayRulesRouter(createSettings())
+        # The router now polls the rules file for changes; stop the looping
+        # call so trial doesn't see a dirty reactor.
+        self.addCleanup(router.rules_manager.read_task.stop)
         for destination in DESTINATIONS:
             router.addDestination(parseDestination(destination))
         self.assertEqual(len(list(router.getDestinations('foo.bar'))), 1)
