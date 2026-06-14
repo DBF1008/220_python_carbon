@@ -142,8 +142,8 @@ def loadAggregationSchemas():
         if state.database is not None:
           if aggregationMethod not in state.database.aggregationMethods:
             raise AssertionError("aggregationMethod not found in state.database.aggregationMethods")
-    except ValueError:
-      log.msg("Invalid schemas found in %s." % section)
+    except (ValueError, AssertionError) as e:
+      log.msg("Invalid schema in section [%s]: %s" % (section, e))
       continue
 
     archives = (xFilesFactor, aggregationMethod)
