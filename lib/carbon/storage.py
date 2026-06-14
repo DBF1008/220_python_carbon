@@ -142,8 +142,12 @@ def loadAggregationSchemas():
         if state.database is not None:
           if aggregationMethod not in state.database.aggregationMethods:
             raise AssertionError("aggregationMethod not found in state.database.aggregationMethods")
-    except ValueError:
-      log.msg("Invalid schemas found in %s." % section)
+    except (ValueError, AssertionError) as e:
+      # An out-of-range xFilesFactor or an unsupported aggregationMethod must not
+      # abort the whole load: log the offending section and skip it so the rest
+      # of the (valid) rules still apply. This keeps the timed reload in
+      # writer.py from discarding a good schema set over one bad section.
+      log.msg("Invalid aggregation schema found in [%s]: %s, skipping." % (section, e))
       continue
 
     archives = (xFilesFactor, aggregationMethod)

@@ -89,3 +89,57 @@ class ExistingConfigSchemaLoadingTest(TestCase):
         schema_list = loadAggregationSchemas()
         last_schema = schema_list[-1]
         self.assertEqual(last_schema, defaultAggregation)
+
+
+class BrokenAggregationConfigLoadingTest(TestCase):
+    """Startup-load resilience for storage-aggregation.conf.
+
+    A section with an xFilesFactor outside [0, 1] or an aggregationMethod the
+    backend does not support must be logged and skipped, never abort the load.
+    This is the path exercised at process start (carbon.writer imports schemas
+    in its module body); the running-server reload path lives in test_writer.py.
+    """
+
+    def setUp(self):
+        test_directory = os.path.dirname(os.path.realpath(__file__))
+        self.bad_aggregation_conf = os.path.join(
+            test_directory, 'data', 'conf-directory-bad-aggregation',
+            'storage-aggregation.conf')
+        settings = TestSettings()
+        settings['CONF_DIR'] = os.path.join(test_directory, 'data', 'conf-directory')
+        settings['LOCAL_DATA_DIR'] = ''
+        self._settings_patch = patch('carbon.conf.settings', settings)
+        self._settings_patch.start()
+        self._database_patch = patch('carbon.state.database', new=WhisperDatabase(settings))
+        self._database_patch.start()
+        # Point the loader at the fixture that mixes valid and invalid sections.
+        # Patch the module constant directly so the test is independent of the
+        # import-time CONF_DIR resolution and of test execution order.
+        self._config_patch = patch(
+            'carbon.storage.STORAGE_AGGREGATION_CONFIG', self.bad_aggregation_conf)
+        self._config_patch.start()
+
+    def tearDown(self):
+        self._config_patch.stop()
+        self._database_patch.stop()
+        self._settings_patch.stop()
+
+    def test_loadAggregationSchemas_skips_invalid_sections(self):
+        from carbon.storage import loadAggregationSchemas
+        # Must return normally despite three invalid sections in the fixture.
+        schema_list = loadAggregationSchemas()
+        names = [schema.name for schema in schema_list]
+        # Valid sections survive...
+        self.assertIn('good_min', names)
+        self.assertIn('good_sum', names)
+        # ...and every invalid section is dropped.
+        self.assertNotIn('bad_xff_out_of_range', names)
+        self.assertNotIn('bad_method', names)
+        self.assertNotIn('bad_xff_not_a_number', names)
+
+    def test_loadAggregationSchemas_keeps_only_valid_plus_default(self):
+        from carbon.storage import loadAggregationSchemas, defaultAggregation
+        schema_list = loadAggregationSchemas()
+        # Two valid sections plus the trailing default aggregation.
+        self.assertEqual(len(schema_list), 3)
+        self.assertEqual(schema_list[-1], defaultAggregation)
