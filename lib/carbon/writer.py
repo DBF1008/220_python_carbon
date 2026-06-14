@@ -13,7 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License."""
 
 import time
-from six.moves import queue
+import threading
+from collections import OrderedDict
 
 from carbon import state
 from carbon.cache import MetricCache
@@ -52,38 +53,72 @@ if settings.MAX_UPDATES_PER_SECOND != float('inf'):
 
 
 class TagQueue(object):
+  """Bounded, de-duplicated, priority-preserving queue of metrics to tag.
+
+  Tagged series go through two stages: a first "create" (``add``) and periodic
+  "updates" (``update``). High-frequency writes to the same series would
+  otherwise enqueue it over and over and flood graphite-web's tagMultiSeries
+  endpoint with redundant requests, so each stage is modelled as an
+  insertion-ordered de-duplication set rather than a plain FIFO:
+
+  * de-duplicated -- a metric is queued at most once per stage;
+  * create supersedes update -- a pending create absorbs any pending update for
+    the same metric, so a series is never queued in both stages at once and the
+    first creation always takes priority over a later update;
+  * bounded -- each stage holds at most ``maxsize`` metrics (``maxsize=0`` means
+    unbounded); excess metrics are dropped rather than growing without bound;
+  * ``TAG_UPDATE_INTERVAL`` preserved -- only every ``update_interval``-th
+    ``update`` call (counted globally across all metrics) is an enqueue trigger.
+
+  ``add``/``update`` run on the writer thread while ``getbatch`` runs on the
+  tag-writer thread, so all access is guarded by a lock.
+  """
+
   def __init__(self, maxsize=0, update_interval=1):
-    self.add_queue = queue.Queue(maxsize)
-    self.update_queue = queue.Queue(maxsize)
+    self.maxsize = maxsize
     self.update_interval = update_interval
     self.update_counter = 0
+    # metric -> None, used as an insertion-ordered de-duplication set.
+    self.add_queue = OrderedDict()
+    self.update_queue = OrderedDict()
+    self.lock = threading.Lock()
 
   def add(self, metric):
-    try:
-      self.add_queue.put_nowait(metric)
-    except queue.Full:
-      pass
+    with self.lock:
+      # A (re)create supersedes any pending update for the same metric.
+      self.update_queue.pop(metric, None)
+      if metric in self.add_queue:
+        return
+      if self.maxsize and len(self.add_queue) >= self.maxsize:
+        return
+      self.add_queue[metric] = None
 
   def update(self, metric):
-    self.update_counter = self.update_counter % self.update_interval + 1
-    if self.update_counter == 1:
-      try:
-        self.update_queue.put_nowait(metric)
-      except queue.Full:
-        pass
+    with self.lock:
+      # Preserve TAG_UPDATE_INTERVAL: only every Nth update() call across all
+      # metrics actually triggers an enqueue.
+      self.update_counter = self.update_counter % self.update_interval + 1
+      if self.update_counter != 1:
+        return
+      if metric in self.add_queue:
+        # A pending create already covers this metric; let creation win.
+        return
+      if metric in self.update_queue:
+        return
+      if self.maxsize and len(self.update_queue) >= self.maxsize:
+        return
+      self.update_queue[metric] = None
 
   def getbatch(self, maxsize=1):
     batch = []
-    while len(batch) < maxsize:
-      try:
-        batch.append(self.add_queue.get_nowait())
-      except queue.Empty:
-        break
-    while len(batch) < maxsize:
-      try:
-        batch.append(self.update_queue.get_nowait())
-      except queue.Empty:
-        break
+    with self.lock:
+      # Drain pending creates first so first creation takes priority, then fill
+      # the remainder of the batch with pending updates. Each queue holds a
+      # metric at most once, so the returned batch is free of duplicates.
+      while self.add_queue and len(batch) < maxsize:
+        batch.append(self.add_queue.popitem(last=False)[0])
+      while self.update_queue and len(batch) < maxsize:
+        batch.append(self.update_queue.popitem(last=False)[0])
     return batch
 
 
